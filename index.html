@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>名刺読み取り</title>
+<style>
+  :root { --bg:#f5f5f7; --card:#fff; --line:#d9d9de; --text:#1d1d1f; --sub:#6e6e73; --accent:#0a5cff; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family:"Yu Gothic","游ゴシック","Hiragino Sans","Noto Sans JP",sans-serif; font-size:15px; }
+  main { max-width:640px; margin:0 auto; padding:16px; }
+  h1 { font-size:18px; margin:0 0 12px; }
+  .btn { display:block; width:100%; padding:14px; border:0; border-radius:10px; background:var(--accent); color:#fff; font-size:16px; text-align:center; cursor:pointer; }
+  .btn.sub { background:#fff; color:var(--text); border:1px solid var(--line); }
+  .btn:disabled { opacity:.5; }
+  .row { display:flex; gap:8px; margin-top:8px; }
+  .row .btn { flex:1; }
+  #preview { display:none; width:100%; margin-top:12px; border-radius:8px; border:1px solid var(--line); }
+  #status { margin:12px 0; color:var(--sub); font-size:13px; min-height:1.2em; }
+  progress { width:100%; height:6px; }
+  .field { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:10px 12px; margin-top:8px; }
+  .field label { display:block; font-size:12px; color:var(--sub); margin-bottom:4px; }
+  .field input, .field textarea { width:100%; border:0; padding:0; font:inherit; font-size:16px; background:transparent; color:var(--text); outline:none; }
+  .field textarea { resize:vertical; min-height:72px; }
+  details { margin-top:12px; }
+  details pre { white-space:pre-wrap; font-size:12px; background:var(--card); border:1px solid var(--line); border-radius:8px; padding:10px; }
+  #results { display:none; }
+</style>
+</head>
+<body>
+<main>
+  <h1>名刺読み取り</h1>
+  <input type="file" id="file" accept="image/*" capture="environment" hidden>
+  <button class="btn" id="shoot">名刺を撮影 / 画像を選択</button>
+  <img id="preview" alt="">
+  <div id="status"></div>
+  <progress id="prog" value="0" max="1" hidden></progress>
+
+  <div id="results">
+    <div class="field"><label>氏名</label><input id="f_name"></div>
+    <div class="field"><label>会社名</label><input id="f_company"></div>
+    <div class="field"><label>住所</label><input id="f_address"></div>
+    <div class="field"><label>電話番号</label><input id="f_tel"></div>
+    <div class="field"><label>携帯番号</label><input id="f_mobile"></div>
+    <div class="field"><label>メールアドレス</label><input id="f_email"></div>
+    <div class="field"><label>URL</label><input id="f_url"></div>
+    <div class="field"><label>SNS</label><input id="f_sns"></div>
+    <div class="field"><label>備考（未分類テキスト・手書きメモ）</label><textarea id="f_note"></textarea></div>
+    <div class="row">
+      <button class="btn sub" id="copy">全項目をコピー</button>
+      <button class="btn sub" id="clear">クリア</button>
+    </div>
+    <details><summary>OCR全文</summary><pre id="raw"></pre></details>
+  </div>
+</main>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/5.1.1/tesseract.min.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const FIELDS = ['name','company','address','tel','mobile','email','url','sns','note'];
+  const LABELS = {name:'氏名',company:'会社名',address:'住所',tel:'電話番号',mobile:'携帯番号',email:'メールアドレス',url:'URL',sns:'SNS',note:'備考'};
+  let worker = null;
+
+  const setStatus = (msg, p) => {
+    $('status').textContent = msg || '';
+    $('prog').hidden = p == null;
+    if (p != null) $('prog').value = p;
+  };
+
+  async function getWorker() {
+    if (worker) return worker;
+    setStatus('OCRエンジンを準備中（初回は言語データ約2.5MBを取得）...', 0);
+    worker = await Tesseract.createWorker('jpn', 1, {
+      logger: m => {
+        if (m.status === 'recognizing text') setStatus('読み取り中...', m.progress);
+        else if (m.status && m.progress != null) setStatus(m.status, m.progress);
+      }
+    });
+    await worker.setParameters({ preserve_interword_spaces: '1' });
+    return worker;
+  }
+
+  // 画像をリサイズ＋グレースケール化してOCR精度と速度を安定させる
+  function toGray(img, maxSide) {
+        const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
+        const c = document.createElement('canvas');
+        c.width = Math.round(img.width * scale);
+        c.height = Math.round(img.height * scale);
+        const ctx = c.getContext('2d');
+        ctx.drawImage(img, 0, 0, c.width, c.height);
+        const d = ctx.getImageData(0, 0, c.width, c.height);
+        const px = d.data;
+        for (let i = 0; i < px.length; i += 4) {
+          const g = 0.299 * px[i] + 0.587 * px[i+1] + 0.114 * px[i+2];
+          px[i] = px[i+1] = px[i+2] = g;
+        }
+        ctx.putImageData(d, 0, 0);
+        return c;
+  }
+
+  // 大きい文字（氏名など）は高解像度だと誤読しやすいため、通常と半分の2解像度でOCRする
+  function preprocess(file) {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => {
+        const full = toGray(img, 1400);
+        const half = toGray(img, 700);
+        URL.revokeObjectURL(img.src);
+        resolve({ full, half });
+      };
+      img.onerror = () => reject(new Error('画像を読み込めません'));
+      img.src = URL.createObjectURL(file);
+    });
+  }
+
+  // 全角英数・記号を半角に、日本語文字間の余分なスペースを除去
+  function normalize(s) {
+    if (!s) return '';
+    s = s.replace(/[Ａ-Ｚａ-ｚ０-９＠．－＋＿：／]/g, ch => String.fromCharCode(ch.charCodeAt(0) - 0xFEE0))
+         .replace(/[‐‑‒–—−ー]/g, m => m)   // 長音は残す
+         .replace(/[（）]/g, m => m === '（' ? '(' : ')')
+         .replace(/[ 　\t]+/g, ' ')
+         .trim();
+    // 日本語文字同士の間のスペースを除去
+    const JP = '[\\u3040-\\u30ff\\u3400-\\u9fff\\uff66-\\uff9f]';
+    const re = new RegExp(`(${JP}) +(?=${JP})`, 'g');
+    let prev;
+    do { prev = s; s = s.replace(re, '$1'); } while (s !== prev);
+    return s;
+  }
+
+  const RE = {
+    email: /[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}/,
+    url: /(?:https?:\/\/|www\.)[^\s　]+|[A-Za-z0-9\-]+\.(?:co\.jp|com|jp|net|org|io)(?:\/[^\s　]*)?/,
+    postal: /〒?\s*\d{3}[-‐−]?\d{4}/,
+    pref: /(東京都|北海道|(?:京都|大阪)府|[^\s　]{2,3}県)/,
+    company: /(株式会社|有限会社|合同会社|合資会社|\(株\)|\(有\)|一般社団法人|医療法人|Co\.,?\s*Ltd|Inc\.|Corporation|LLC)/i,
+    sns: /(@[A-Za-z0-9_.]{3,}|\b(?:twitter|x|instagram|facebook|line|linkedin|tiktok)\b)/i,
+    phoneNum: /(?:\+81[-\s]?)?0\d{1,4}[-\s()]*\d{1,4}[-\s()]*\d{3,4}/g,
+    mobileHead: /^(?:\+81[-\s]?)?0[789]0/,
+    telLabel: /^(TEL|Tel|電話|直通|代表)[.:：\s]*/i,
+    faxLabel: /(FAX|Fax|ファックス)/i,
+    mobileLabel: /(携帯|Mobile|MOBILE|Cell)/i,
+    nameLike: /^(?=.*[一-鿿])[一-鿿぀-ヿ]{1,4} ?[一-鿿぀-ヿ]{1,4}$/,
+    nameKana: /^[぀-ゟ゠-ヿ ]{3,12}$/,
+    titleWord: /(部長|課長|係長|主任|取締役|代表|社長|専務|常務|営業|部|課|室|担当|マネージャー|Manager|Director|CEO|CTO|Sales)/
+  };
+
+  function cleanPhone(s) { return s.replace(/[^\d+\-()]/g, '').replace(/\(/g,'').replace(/\)/g,'-').replace(/-+/g,'-').replace(/^-|-$/g,''); }
+
+  // 文字bigramの重なりで同一行（別解像度の重複読み取り）を判定
+  function bigrams(s) { const k = s.replace(/[\s　]/g, ''); const set = new Set(); for (let i = 0; i < k.length - 1; i++) set.add(k.slice(i, i + 2)); return set; }
+  function similar(a, b) {
+    const A = bigrams(a), B = bigrams(b);
+    if (!A.size || !B.size) return a === b;
+    let hit = 0; A.forEach(x => { if (B.has(x)) hit++; });
+    return hit / (A.size + B.size - hit) >= 0.6;   // Jaccard係数
+  }
+  // 意味のある文字（漢字・かな・英数）の割合。大きい文字の誤読ノイズを除くため
+  function meaningfulRatio(s) {
+    const k = s.replace(/[\s　]/g, '');
+    if (!k) return 0;
+    const m = k.match(/[一-鿿぀-ゟ゠-ヾ゙-ヿA-Za-z0-9@]/g);
+    return (m ? m.length : 0) / k.length;
+  }
+  // 2パスの行を統合：似た行は信頼度の高い方を残す（位置は先勝ち）
+  function mergeLines(primary, secondary) {
+    const merged = [];
+    for (const ln of primary.concat(secondary)) {
+      const t = normalize(ln.text);
+      if (!t) continue;
+      const i = merged.findIndex(m => similar(normalize(m.text), t));
+      if (i < 0) merged.push(ln);
+      else if ((ln.conf || 0) > (merged[i].conf || 0)) merged[i] = ln;
+    }
+    return merged;
+  }
+
+  function extract(lines) {
+    const out = Object.fromEntries(FIELDS.map(k => [k, '']));
+    const rest = [];
+    const nameCands = [];
+
+    for (const ln of lines) {
+      let t = normalize(ln.text);
+      if (!t) continue;
+      if ((ln.conf || 0) < 50 || meaningfulRatio(t) < 0.6) continue;   // 低信頼度・記号だらけの行は捨てる
+      t = t.replace(/^[T〒]\s*(?=\d{3}-?\d{4})/, '〒');   // 〒がTに誤読されるケース
+      let used = false;
+
+      const em = t.match(RE.email);
+      if (em) { if (!out.email) out.email = em[0].toLowerCase(); used = true; }
+
+      const phones = (t.match(RE.phoneNum) || []).map(cleanPhone).filter(p => p.replace(/\D/g,'').length >= 10);
+      if (phones.length) {
+        for (const p of phones) {
+          const isMobile = RE.mobileLabel.test(t) || RE.mobileHead.test(p);
+          if (RE.faxLabel.test(t) && !RE.telLabel.test(t) && phones.length === 1) continue;
+          if (isMobile && !out.mobile) out.mobile = p;
+          else if (!isMobile && !out.tel) out.tel = p;
+        }
+        used = true;
+      }
+
+      if (!used) {
+        const um = t.match(RE.url);
+        let remain = t;
+        if (um) {
+          if (!out.url) out.url = um[0]; else rest.push(um[0]);
+          remain = t.replace(um[0], '').replace(/^[\s:：]+|[\s:：]+$/g, '');
+          used = true;
+        }
+        if (RE.sns.test(remain)) { out.sns = out.sns ? out.sns + ' / ' + remain : remain; used = true; }
+        else if (um && remain.length >= 3) rest.push(remain);
+      }
+
+      if (!used && (RE.postal.test(t) || (RE.pref.test(t) && /\d/.test(t)))) {
+        out.address = out.address ? out.address + ' ' + t : t; used = true;
+      } else if (!used && out.address && !RE.company.test(t) && /(ビル|階|F$|号|丁目|番地)/.test(t)) {
+        out.address += ' ' + t; used = true;   // 住所の続き行
+      }
+
+      if (!used && RE.company.test(t)) {
+        if (!out.company) out.company = t; else rest.push(t);
+        used = true;
+      }
+
+      if (!used) {
+        if (RE.nameKana.test(t)) used = true;   // ふりがな行は捨てる
+        else if (RE.nameLike.test(t) && !RE.titleWord.test(t)) { nameCands.push({ t: ln.text.trim().replace(/[ 　]+/g, '　'), h: ln.h }); used = true; }
+      }
+      if (!used) rest.push(t);
+    }
+
+    // 氏名候補: 文字高（フォントサイズ）が最大のものを採用。他候補は備考へ
+    if (nameCands.length) {
+      nameCands.sort((a, b) => b.h - a.h);
+      out.name = nameCands[0].t;
+      nameCands.slice(1).forEach(c => rest.push(c.t));
+    }
+    out.note = rest.join('\n');
+    return out;
+  }
+
+  async function run(file) {
+    try {
+      $('results').style.display = 'none';
+      const { full, half } = await preprocess(file);
+      $('preview').src = full.toDataURL('image/jpeg', 0.8);
+      $('preview').style.display = 'block';
+      const w = await getWorker();
+      setStatus('読み取り中...', 0);
+      const toLines = (data, scale) => (data.lines || []).map(l => ({
+        text: l.text, conf: l.confidence, h: l.bbox ? (l.bbox.y1 - l.bbox.y0) * scale : 0
+      }));
+      const r1 = await w.recognize(full);
+      const r2 = await w.recognize(half);
+      // 通常解像度の行を基準に、縮小画像で読めた行（大きい文字など）を信頼度で統合
+      const lines = mergeLines(toLines(r1.data, 1), toLines(r2.data, 2));
+      const r = extract(lines);
+      FIELDS.forEach(k => { $('f_' + k).value = r[k] || ''; });
+      $('raw').textContent = (r1.data.text || '') + '\n----- (縮小画像) -----\n' + (r2.data.text || '');
+      $('results').style.display = 'block';
+      setStatus('読み取り完了。内容を確認・修正してください。', null);
+    } catch (e) {
+      console.error(e);
+      setStatus('エラー: ' + (e && e.message ? e.message : e), null);
+    }
+  }
+
+  $('shoot').addEventListener('click', () => $('file').click());
+  $('file').addEventListener('change', e => {
+    const f = e.target.files && e.target.files[0];
+    if (f) run(f);
+    e.target.value = '';
+  });
+  $('clear').addEventListener('click', () => {
+    FIELDS.forEach(k => { $('f_' + k).value = ''; });
+    $('raw').textContent = '';
+    $('results').style.display = 'none';
+    $('preview').style.display = 'none';
+    setStatus('', null);
+  });
+  $('copy').addEventListener('click', async () => {
+    const text = FIELDS.map(k => `${LABELS[k]}：${$('f_' + k).value}`).join('\n');
+    try {
+      await navigator.clipboard.writeText(text);
+      setStatus('コピーしました。', null);
+    } catch (_) {
+      setStatus('コピーに失敗しました。手動で選択してください。', null);
+    }
+  });
+})();
+</script>
+</body>
+</html>
