@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>名刺読み取り</title>
+<title>読み取りツール（名刺／テキスト）</title>
 <style>
   :root { --bg:#f5f5f7; --card:#fff; --line:#d9d9de; --text:#1d1d1f; --sub:#6e6e73; --accent:#0a5cff; }
   * { box-sizing:border-box; }
@@ -27,18 +27,35 @@
   #results { display:none; }
   #cropWrap { display:none; margin-top:12px; }
   #crop { width:100%; display:block; border-radius:8px; border:1px solid var(--line); touch-action:none; background:#222; }
-  #cropWrap .hint { font-size:12px; color:var(--sub); margin:6px 0 0; }
+  .hint { font-size:12px; color:var(--sub); margin:6px 0 0; }
+  #modeSelect .hint { margin:6px 0 0; }
 </style>
 </head>
 <body>
 <main>
-  <h1>名刺読み取り</h1>
+  <div id="modeSelect">
+    <h1>読み取りモードを選択</h1>
+    <button class="btn" id="modeCard">名刺スキャン</button>
+    <p class="hint">名刺を撮影して、氏名・会社名・電話・メールなどの項目に自動で振り分けます</p>
+    <button class="btn" id="modeText" style="margin-top:12px">テキスト読み取り</button>
+    <p class="hint">書類・本・掲示物など、写した文字をそのままテキストにします（横書き・縦書き自動判定）</p>
+  </div>
+  <div id="app" style="display:none">
+  <h1><span id="modeTitle">名刺読み取り</span> <a href="#" id="modeBack" style="font-size:12px;font-weight:normal;color:var(--accent);margin-left:8px">モード変更</a></h1>
+  <div id="langRow" style="display:none;margin-bottom:8px">
+    <label style="font-size:12px;color:var(--sub)">言語：
+      <select id="lang" style="font:inherit;font-size:14px;padding:4px 8px;border:1px solid var(--line);border-radius:6px;background:#fff">
+        <option value="jpn" selected>日本語（横書き／縦書き自動）</option>
+        <option value="eng">英語</option>
+      </select>
+    </label>
+  </div>
   <input type="file" id="file" accept="image/*" capture="environment" hidden>
-  <button class="btn" id="shoot">名刺を撮影 / 画像を選択</button>
-  <p id="hint" style="font-size:12px;color:var(--sub);margin:8px 0 0">コツ：明るい場所で、影を入れず真上から、名刺が画面いっぱいになるように撮影してください。</p>
+  <button class="btn" id="shoot">撮影 / 画像を選択</button>
+  <p id="hint" class="hint">コツ：明るい場所で、影を入れず真上から、名刺が画面いっぱいになるように撮影してください。</p>
   <div id="cropWrap">
     <canvas id="crop"></canvas>
-    <p class="hint">名刺の4隅に合わせて青い点を動かしてください（斜めでも可・自動で長方形に補正します）。中をドラッグで全体移動</p>
+    <p class="hint" id="cropHint">名刺の4隅に合わせて青い点を動かしてください（斜めでも可・自動で長方形に補正します）。中をドラッグで全体移動</p>
     <div class="row">
       <button class="btn sub" id="rotate">回転</button>
       <button class="btn sub" id="reset">枠を全体に</button>
@@ -64,6 +81,14 @@
       <button class="btn sub" id="clear">クリア</button>
     </div>
     <details><summary>OCR全文</summary><pre id="raw"></pre></details>
+  </div>
+  <div id="textResults" style="display:none">
+    <div class="field"><label>読み取り結果（編集できます）</label><textarea id="f_text" style="min-height:240px"></textarea></div>
+    <div class="row">
+      <button class="btn sub" id="copyText">テキストをコピー</button>
+      <button class="btn sub" id="clearText">クリア</button>
+    </div>
+  </div>
   </div>
 </main>
 
@@ -662,7 +687,51 @@
     return { rot: horiz.rot, vertical: v.score >= 40 && v.score >= horiz.score * 0.5 && horiz.rot === 0 };
   }
 
+  // ---------- テキスト読み取りモード（汎用） ----------
+  async function runText() {
+    try {
+      $('textResults').style.display = 'none';
+      $('ocr').disabled = true;
+      const img = cropped();
+      const lang = $('lang').value;
+      const { jpn, eng } = await getWorkers();
+      let worker = eng, vertical = false;
+      if (lang === 'jpn') {
+        // 横書き／縦書きの判定：1000px縮小画像で両モデルを試し、読めた度合いで決める
+        setStatus('横書き／縦書きを判定中...', 0.05);
+        const probe = toGray(img, 1000);
+        const hs = readScore((await jpn.recognize(probe)).data);
+        const vs = readScore((await (await getVertWorker()).recognize(probe)).data);
+        vertical = vs > hs * 1.15;   // 縦書きが明確に優勢な場合だけ縦書き扱い
+        worker = vertical ? await getVertWorker() : jpn;
+      }
+      setStatus(vertical ? '読み取り中（縦書き）...' : '読み取り中...', 0.3);
+      // 書類は文字が小さいため名刺より大きい解像度で読む
+      const full = toGray(img, 2200);
+      const r = await worker.recognize(full);
+      const lines = (r.data.text || '').split('\n').map(l => {
+        let t = l.replace(/[ \t]+$/, '');
+        if (lang === 'jpn') {
+          // 日本語文字同士の間の空白を除去（Tesseractが文字ごとに空白を入れるため）。英数字間の空白は残す
+          const JP = '[\\u3040-\\u30ff\\u3400-\\u9fff\\uff01-\\uff5e\\u3000-\\u303f]';
+          const re = new RegExp(`(${JP}) +(?=${JP})`, 'g');
+          let prev; do { prev = t; t = t.replace(re, '$1'); } while (t !== prev);
+        }
+        return t;
+      });
+      $('f_text').value = lines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+      $('textResults').style.display = 'block';
+      setStatus('読み取り完了。内容を確認・修正してください。', null);
+    } catch (e) {
+      console.error(e);
+      setStatus('エラー: ' + (e && e.message ? e.message : e), null);
+    } finally {
+      $('ocr').disabled = false;
+    }
+  }
+
   async function run() {
+    if (mode === 'text') return runText();
     try {
       $('results').style.display = 'none';
       $('ocr').disabled = true;
@@ -729,6 +798,41 @@
     }
   }
 
+  // ---------- モード選択 ----------
+  let mode = 'card';
+  function setMode(m) {
+    mode = m;
+    $('modeSelect').style.display = 'none';
+    $('app').style.display = 'block';
+    $('modeTitle').textContent = m === 'card' ? '名刺読み取り' : 'テキスト読み取り';
+    $('langRow').style.display = m === 'text' ? 'block' : 'none';
+    $('hint').textContent = m === 'card'
+      ? 'コツ：明るい場所で、影を入れず真上から、名刺が画面いっぱいになるように撮影してください。'
+      : 'コツ：明るい場所で、影を入れず真上から、文字が画面いっぱいになるように撮影してください。ページの一部だけでも読み取れます。';
+    $('cropHint').textContent = m === 'card'
+      ? '名刺の4隅に合わせて青い点を動かしてください（斜めでも可・自動で長方形に補正します）。中をドラッグで全体移動'
+      : '読み取りたい範囲の4隅に青い点を合わせてください（斜めでも可・自動で長方形に補正します）。中をドラッグで全体移動';
+    $('results').style.display = 'none';
+    $('textResults').style.display = 'none';
+    $('cropWrap').style.display = 'none';
+    cropper.src = null;
+    setStatus('', null);
+  }
+  $('modeCard').addEventListener('click', () => setMode('card'));
+  $('modeText').addEventListener('click', () => setMode('text'));
+  $('modeBack').addEventListener('click', e => { e.preventDefault(); $('app').style.display = 'none'; $('modeSelect').style.display = 'block'; });
+  $('copyText').addEventListener('click', async () => {
+    try { await navigator.clipboard.writeText($('f_text').value); setStatus('コピーしました。', null); }
+    catch (_) { setStatus('コピーに失敗しました。手動で選択してください。', null); }
+  });
+  $('clearText').addEventListener('click', () => {
+    $('f_text').value = '';
+    $('textResults').style.display = 'none';
+    $('cropWrap').style.display = 'none';
+    cropper.src = null;
+    setStatus('', null);
+  });
+
   $('shoot').addEventListener('click', () => $('file').click());
   $('file').addEventListener('change', async e => {
     const f = e.target.files && e.target.files[0];
@@ -736,6 +840,7 @@
     if (!f) return;
     try {
       $('results').style.display = 'none';
+      $('textResults').style.display = 'none';
       setStatus('', null);
       setSource(await loadImage(f));
     } catch (err) {
