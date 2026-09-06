@@ -38,7 +38,7 @@
   <p id="hint" style="font-size:12px;color:var(--sub);margin:8px 0 0">コツ：明るい場所で、影を入れず真上から、名刺が画面いっぱいになるように撮影してください。</p>
   <div id="cropWrap">
     <canvas id="crop"></canvas>
-    <p class="hint">名刺に合わせて枠を調整してください（角をドラッグで拡縮、中をドラッグで移動）</p>
+    <p class="hint">名刺の4隅に合わせて青い点を動かしてください（斜めでも可・自動で長方形に補正します）。中をドラッグで全体移動</p>
     <div class="row">
       <button class="btn sub" id="rotate">回転</button>
       <button class="btn sub" id="reset">枠を全体に</button>
@@ -113,11 +113,23 @@
         const ctx = c.getContext('2d');
         ctx.drawImage(img, 0, 0, c.width, c.height);
         const d = ctx.getImageData(0, 0, c.width, c.height);
-        const px = d.data;
+        const px = d.data, Wc = c.width, Hc = c.height, N = Wc * Hc;
+        const gray = new Float32Array(N);
+        for (let i = 0; i < N; i++) gray[i] = 0.299 * px[i*4] + 0.587 * px[i*4+1] + 0.114 * px[i*4+2];
+        // 照明ムラ補正（フラットフィールド）：各画素を周囲（約1/20幅の窓）の平均輝度で割り、紙を白・文字を黒に揃える。影や机の縁も消える
+        const win = Math.max(15, Math.round(Math.max(Wc, Hc) / 20)), hw = win >> 1;
+        const integ = new Float64Array((Wc + 1) * (Hc + 1));
+        for (let y = 1; y <= Hc; y++) { let rowSum = 0; for (let x = 1; x <= Wc; x++) { rowSum += gray[(y - 1) * Wc + (x - 1)]; integ[y * (Wc + 1) + x] = integ[(y - 1) * (Wc + 1) + x] + rowSum; } }
         const hist = new Uint32Array(256);
-        for (let i = 0; i < px.length; i += 4) {
-          const g = (0.299 * px[i] + 0.587 * px[i+1] + 0.114 * px[i+2]) | 0;
-          px[i] = g; hist[g]++;
+        for (let y = 0; y < Hc; y++) {
+          const y0 = Math.max(0, y - hw), y1 = Math.min(Hc, y + hw + 1);
+          for (let x = 0; x < Wc; x++) {
+            const x0 = Math.max(0, x - hw), x1 = Math.min(Wc, x + hw + 1);
+            const mean = (integ[y1 * (Wc + 1) + x1] - integ[y0 * (Wc + 1) + x1] - integ[y1 * (Wc + 1) + x0] + integ[y0 * (Wc + 1) + x0]) / ((y1 - y0) * (x1 - x0));
+            // 周囲平均より明るい＝紙（255）、暗い＝文字。平均に対する比で正規化
+            const g = Math.max(0, Math.min(255, (gray[y * Wc + x] / (mean + 1)) * 235)) | 0;
+            px[(y * Wc + x) * 4] = g; hist[g]++;
+          }
         }
         // コントラスト伸長：2%〜98%点を0〜255に引き伸ばす（影・薄い印字対策）
         const total = px.length / 4;
@@ -170,7 +182,7 @@
     const g = new Uint8Array(W * H);
     for (let i = 0; i < W * H; i++) g[i] = (0.299 * px[i*4] + 0.587 * px[i*4+1] + 0.114 * px[i*4+2]) | 0;
     const sx = src.width / W, sy = src.height / H;
-    const toRect = (x0, y0, x1, y1) => ({ x: x0 * sx, y: y0 * sy, w: (x1 - x0 + 1) * sx, h: (y1 - y0 + 1) * sy });
+    const toQuad = (x0, y0, x1, y1) => [[x0 * sx, y0 * sy], [(x1 + 1) * sx, y0 * sy], [(x1 + 1) * sx, (y1 + 1) * sy], [x0 * sx, (y1 + 1) * sy]];   // 左上・右上・右下・左下
 
     // 1) 画像の縁の色を背景色とみなし、背景と色が異なる画素の最大連結成分を名刺とする
     const border = [[], [], []], m = Math.max(2, Math.round(Math.min(W, H) * 0.04));
@@ -199,7 +211,7 @@
           lab[j] = s0; stack.push(j);
         }
       }
-      if (area > bestArea) { bestArea = area; bestBox = { x0, y0, x1, y1 }; }
+      if (area > bestArea) { bestArea = area; bestBox = { x0, y0, x1, y1, id: s0 }; }
     }
     if (bestBox) {
       // 名刺の脇に写り込んだ明るい机などを削る：各辺について「ほぼ全行（列）にエッジが連続する位置」＝名刺の縁を探す
@@ -231,7 +243,46 @@
       const bw = x1 - x0 + 1, bh = y1 - y0 + 1;
       let inside = 0; for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) if (fg[y * W + x]) inside++;
       const fill = inside / (bw * bh), areaRatio = (bw * bh) / (W * H);
-      if (fill > 0.6 && areaRatio > 0.08 && areaRatio < 0.97) return toRect(x0, y0, x1, y1);
+      if (fill > 0.6 && areaRatio > 0.08 && areaRatio < 0.97) {
+        // 傾いた名刺の4隅：各辺の帯域で「背景→名刺」への境界画素を集め、ハフ変換で最も強い直線を辺とし、隣接辺の交点を隅とする
+        const bwid = x1 - x0, bhgt = y1 - y0;
+        const hough = (horizontal, band) => {   // horizontal: 上下の辺（水平±30°）、それ以外は左右の辺（垂直±30°）
+          const acc = new Map(); let best = null, bestV = 0;
+          const [bx0, by0, bx1, by1] = band.map(Math.round);   // 添字は整数でなければならない
+          for (let y = Math.max(1, by0); y <= Math.min(H - 2, by1); y++) for (let x = Math.max(1, bx0); x <= Math.min(W - 2, bx1); x++) {
+            const i = y * W + x;
+            const isEdge = horizontal ? (fg[i - W] !== fg[i + W]) : (fg[i - 1] !== fg[i + 1]);
+            if (!isEdge) continue;
+            for (let t = -30; t <= 30; t += 1) {
+              const th = t * Math.PI / 180;
+              const rho = Math.round(horizontal ? (y * Math.cos(th) - x * Math.sin(th)) : (x * Math.cos(th) - y * Math.sin(th)));
+              const key = t * 100000 + rho, v = (acc.get(key) || 0) + 1; acc.set(key, v);
+              if (v > bestV) { bestV = v; best = { th, rho }; }
+            }
+          }
+          if (!best || bestV < (horizontal ? bwid : bhgt) * 0.3) return null;   // 辺の長さの3割未満しか票が無ければ不採用
+          const { th, rho } = best;
+          return horizontal ? { a: -Math.sin(th), b: Math.cos(th), c: rho } : { a: Math.cos(th), b: -Math.sin(th), c: rho };
+        };
+        const cross = (l1, l2) => {   // 2直線 a x + b y = c の交点
+          if (!l1 || !l2) return null;
+          const det = l1.a * l2.b - l2.a * l1.b; if (Math.abs(det) < 1e-6) return null;
+          return [(l1.c * l2.b - l2.c * l1.b) / det, (l1.a * l2.c - l2.a * l1.c) / det];
+        };
+        const m = 6;
+        const top = hough(true, [x0, y0 - m, x1, y0 + bhgt * 0.35]), bottom = hough(true, [x0, y1 - bhgt * 0.35, x1, y1 + m]);
+        const left = hough(false, [x0 - m, y0, x0 + bwid * 0.35, y1]), right = hough(false, [x1 - bwid * 0.35, y0, x1 + m, y1]);
+        const box = [[x0, y0], [x1 + 1, y0], [x1 + 1, y1 + 1], [x0, y1 + 1]];
+        const pts = [cross(top, left), cross(top, right), cross(bottom, right), cross(bottom, left)];
+        // 交点が外接矩形（少し拡張）の内側にあり、矩形の隅から極端に離れていなければ採用。それ以外は矩形の隅
+        const tol = Math.min(bwid, bhgt) * 0.7, gx = bwid * 0.08, gy = bhgt * 0.08, ex0 = x0 - gx, ey0 = y0 - gy, ex1 = x1 + gx, ey1 = y1 + gy;
+        const quad = box.map(([cx, cy], i) => {
+          const p = pts[i];
+          const ok = p && p[0] >= ex0 && p[0] <= ex1 && p[1] >= ey0 && p[1] <= ey1 && Math.hypot(p[0] - cx, p[1] - cy) < tol;
+          return ok ? [p[0] * sx, p[1] * sy] : [cx * sx, cy * sy];
+        });
+        return quad;
+      }
     }
     // 2) エッジ密度から文字のある範囲を推定し、少し余白を付ける
     const rows = new Float32Array(H), cols = new Float32Array(W);
@@ -244,17 +295,17 @@
     const [ya, yb] = span(rows, H), [xa, xb] = span(cols, W);
     if (xb - xa > W * 0.2 && yb - ya > H * 0.1) {
       const mx = (xb - xa) * 0.06, my = (yb - ya) * 0.12;
-      return toRect(Math.max(0, xa - mx), Math.max(0, ya - my), Math.min(W - 1, xb + mx), Math.min(H - 1, yb + my));
+      return toQuad(Math.max(0, xa - mx), Math.max(0, ya - my), Math.min(W - 1, xb + mx), Math.min(H - 1, yb + my));
     }
     // 3) 全体
-    return { x: 0, y: 0, w: src.width, h: src.height };
+    return [[0, 0], [src.width, 0], [src.width, src.height], [0, src.height]];
   }
 
-  // トリミングUI（枠のドラッグ移動・角のドラッグ拡縮）
-  const cropper = { src: null, rect: null, scale: 1, drag: null };
+  // トリミングUI：4隅を独立に動かせる四角形（斜めから撮った名刺は射影変換で長方形に補正）
+  const cropper = { src: null, quad: null, scale: 1, drag: null };
   const cropCv = $('crop');
   function drawCrop() {
-    const { src, rect } = cropper; if (!src) return;
+    const { src, quad } = cropper; if (!src) return;
     const cssW = cropCv.clientWidth || 360;
     cropper.scale = cssW / src.width;
     cropCv.width = cssW; cropCv.height = Math.round(src.height * cropper.scale);
@@ -262,41 +313,41 @@
     ctx.drawImage(src, 0, 0, cropCv.width, cropCv.height);
     ctx.fillStyle = 'rgba(0,0,0,0.5)';
     ctx.fillRect(0, 0, cropCv.width, cropCv.height);
-    ctx.drawImage(src, rect.x, rect.y, rect.w, rect.h, rect.x * k, rect.y * k, rect.w * k, rect.h * k);
-    ctx.strokeStyle = '#0a5cff'; ctx.lineWidth = 2; ctx.strokeRect(rect.x * k, rect.y * k, rect.w * k, rect.h * k);
+    ctx.save();
+    ctx.beginPath(); quad.forEach(([x, y], i) => i ? ctx.lineTo(x * k, y * k) : ctx.moveTo(x * k, y * k)); ctx.closePath(); ctx.clip();
+    ctx.drawImage(src, 0, 0, cropCv.width, cropCv.height);
+    ctx.restore();
+    ctx.beginPath(); quad.forEach(([x, y], i) => i ? ctx.lineTo(x * k, y * k) : ctx.moveTo(x * k, y * k)); ctx.closePath();
+    ctx.strokeStyle = '#0a5cff'; ctx.lineWidth = 2; ctx.stroke();
     ctx.fillStyle = '#0a5cff';
-    for (const [cx, cy] of corners()) { ctx.beginPath(); ctx.arc(cx * k, cy * k, 9, 0, Math.PI * 2); ctx.fill(); }
+    for (const [x, y] of quad) { ctx.beginPath(); ctx.arc(x * k, y * k, 10, 0, Math.PI * 2); ctx.fill(); }
   }
-  function corners() { const r = cropper.rect; return [[r.x, r.y], [r.x + r.w, r.y], [r.x, r.y + r.h], [r.x + r.w, r.y + r.h]]; }
-  function clampRect() {
-    const r = cropper.rect, s = cropper.src, MIN = 40;
-    r.w = Math.max(MIN, r.w); r.h = Math.max(MIN, r.h);
-    r.x = Math.max(0, Math.min(s.width - r.w, r.x)); r.y = Math.max(0, Math.min(s.height - r.h, r.y));
-    r.w = Math.min(r.w, s.width - r.x); r.h = Math.min(r.h, s.height - r.y);
+  function clampQuad() {
+    const s = cropper.src;
+    cropper.quad = cropper.quad.map(([x, y]) => [Math.max(0, Math.min(s.width, x)), Math.max(0, Math.min(s.height, y))]);
+  }
+  function insideQuad(p) {   // 凸四角形の内外判定（外積の符号）
+    const q = cropper.quad; let pos = 0, neg = 0;
+    for (let i = 0; i < 4; i++) { const a = q[i], b = q[(i + 1) % 4]; const c = (b[0] - a[0]) * (p.y - a[1]) - (b[1] - a[1]) * (p.x - a[0]); if (c > 0) pos++; else if (c < 0) neg++; }
+    return !(pos && neg);
   }
   function ptr(e) { const b = cropCv.getBoundingClientRect(); return { x: (e.clientX - b.left) / cropper.scale, y: (e.clientY - b.top) / cropper.scale }; }
   cropCv.addEventListener('pointerdown', e => {
     if (!cropper.src) return;
-    const p = ptr(e), r = cropper.rect, R = 24 / cropper.scale;
-    let corner = -1;
-    corners().forEach(([cx, cy], i) => { if (Math.hypot(p.x - cx, p.y - cy) < R) corner = i; });
-    const inside = p.x > r.x && p.x < r.x + r.w && p.y > r.y && p.y < r.y + r.h;
-    if (corner < 0 && !inside) return;
-    cropper.drag = { corner, start: p, rect: { ...r } };
+    const p = ptr(e), R = 28 / cropper.scale;
+    let corner = -1, bd = R;
+    cropper.quad.forEach(([x, y], i) => { const d = Math.hypot(p.x - x, p.y - y); if (d < bd) { bd = d; corner = i; } });
+    if (corner < 0 && !insideQuad(p)) return;
+    cropper.drag = { corner, start: p, quad: cropper.quad.map(q => q.slice()) };
     cropCv.setPointerCapture(e.pointerId);
     e.preventDefault();
   });
   cropCv.addEventListener('pointermove', e => {
     const d = cropper.drag; if (!d) return;
-    const p = ptr(e), dx = p.x - d.start.x, dy = p.y - d.start.y, o = d.rect, r = cropper.rect;
-    if (d.corner < 0) { r.x = o.x + dx; r.y = o.y + dy; }
-    else {
-      const left = d.corner % 2 === 0, top = d.corner < 2;
-      const x0 = left ? o.x + dx : o.x, x1 = left ? o.x + o.w : o.x + o.w + dx;
-      const y0 = top ? o.y + dy : o.y, y1 = top ? o.y + o.h : o.y + o.h + dy;
-      r.x = Math.min(x0, x1); r.w = Math.abs(x1 - x0); r.y = Math.min(y0, y1); r.h = Math.abs(y1 - y0);
-    }
-    clampRect(); drawCrop();
+    const p = ptr(e), dx = p.x - d.start.x, dy = p.y - d.start.y;
+    if (d.corner < 0) cropper.quad = d.quad.map(([x, y]) => [x + dx, y + dy]);   // 中をドラッグ：全体を移動
+    else { cropper.quad = d.quad.map(q => q.slice()); cropper.quad[d.corner] = [d.quad[d.corner][0] + dx, d.quad[d.corner][1] + dy]; }   // 角をドラッグ：その角だけ移動
+    clampQuad(); drawCrop();
   });
   const endDrag = () => { cropper.drag = null; };
   cropCv.addEventListener('pointerup', endDrag); cropCv.addEventListener('pointercancel', endDrag);
@@ -304,29 +355,71 @@
 
   function setSource(src) {
     cropper.src = src;
-    cropper.rect = detectCard(src);
-    // 検出枠に3%の余白（傾きで角が切れるのを防ぐ）
-    const r = cropper.rect, mx = r.w * 0.03, my = r.h * 0.03;
-    r.x -= mx; r.y -= my; r.w += mx * 2; r.h += my * 2; clampRect();
+    const q = detectCard(src);
+    // 検出枠に約1.5%の余白（少し外側に広げる）
+    const cx = q.reduce((a, p) => a + p[0], 0) / 4, cy = q.reduce((a, p) => a + p[1], 0) / 4;
+    cropper.quad = q.map(([x, y]) => [cx + (x - cx) * 1.015, cy + (y - cy) * 1.015]);
+    clampQuad();
     $('cropWrap').style.display = 'block';
     drawCrop();
   }
   // 画像と枠をまとめて時計回りに90度×n回転
   function rotateAll(n) {
     for (let i = 0; i < n; i++) {
-      const r = cropper.rect, H = cropper.src.height;
+      const H = cropper.src.height;
       cropper.src = rotate90(cropper.src);
-      cropper.rect = { x: H - (r.y + r.h), y: r.x, w: r.h, h: r.w };
+      const q = cropper.quad.map(([x, y]) => [H - y, x]);
+      cropper.quad = [q[3], q[0], q[1], q[2]];   // 左上・右上・右下・左下 の順を保つ
     }
     drawCrop();
   }
   $('rotate').addEventListener('click', () => { if (cropper.src) rotateAll(1); });
-  $('reset').addEventListener('click', () => { if (cropper.src) { cropper.rect = { x: 0, y: 0, w: cropper.src.width, h: cropper.src.height }; drawCrop(); } });
+  $('reset').addEventListener('click', () => { if (cropper.src) { const s = cropper.src; cropper.quad = [[0, 0], [s.width, 0], [s.width, s.height], [0, s.height]]; drawCrop(); } });
 
+  // 射影変換：出力の長方形(x,y) → 元画像の四角形内の座標 を求める係数（8元連立方程式）
+  function homography(dstW, dstH, quad) {
+    const src = [[0, 0], [dstW, 0], [dstW, dstH], [0, dstH]], A = [], b = [];
+    for (let i = 0; i < 4; i++) {
+      const [x, y] = src[i], [u, v] = quad[i];
+      A.push([x, y, 1, 0, 0, 0, -u * x, -u * y]); b.push(u);
+      A.push([0, 0, 0, x, y, 1, -v * x, -v * y]); b.push(v);
+    }
+    for (let c = 0; c < 8; c++) {   // ガウスの消去法（部分ピボット）
+      let piv = c; for (let r = c + 1; r < 8; r++) if (Math.abs(A[r][c]) > Math.abs(A[piv][c])) piv = r;
+      [A[c], A[piv]] = [A[piv], A[c]]; [b[c], b[piv]] = [b[piv], b[c]];
+      for (let r = 0; r < 8; r++) {
+        if (r === c || !A[c][c]) continue;
+        const f = A[r][c] / A[c][c];
+        for (let k = c; k < 8; k++) A[r][k] -= f * A[c][k];
+        b[r] -= f * b[c];
+      }
+    }
+    return b.map((v, i) => v / A[i][i]);   // h0..h7
+  }
+
+  // 四角形の範囲を長方形に補正して切り出す（各画素について元画像の座標を逆算し、バイリニア補間）
   function cropped() {
-    const r = cropper.rect, c = document.createElement('canvas');
-    c.width = Math.round(r.w); c.height = Math.round(r.h);
-    c.getContext('2d').drawImage(cropper.src, r.x, r.y, r.w, r.h, 0, 0, c.width, c.height);
+    const q = cropper.quad, s = cropper.src;
+    const len = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
+    const dw = Math.max(40, Math.round((len(q[0], q[1]) + len(q[3], q[2])) / 2));
+    const dh = Math.max(40, Math.round((len(q[0], q[3]) + len(q[1], q[2])) / 2));
+    const h = homography(dw, dh, q);
+    const sctx = s.getContext('2d'), sd = sctx.getImageData(0, 0, s.width, s.height).data, sw = s.width, sh = s.height;
+    const c = document.createElement('canvas'); c.width = dw; c.height = dh;
+    const ctx = c.getContext('2d'), od = ctx.createImageData(dw, dh), o = od.data;
+    for (let y = 0; y < dh; y++) for (let x = 0; x < dw; x++) {
+      const den = h[6] * x + h[7] * y + 1;
+      const u = (h[0] * x + h[1] * y + h[2]) / den, v = (h[3] * x + h[4] * y + h[5]) / den;
+      const oi = (y * dw + x) * 4;
+      if (u < 0 || v < 0 || u >= sw - 1 || v >= sh - 1) { o[oi] = o[oi+1] = o[oi+2] = 255; o[oi+3] = 255; continue; }
+      const x0 = u | 0, y0 = v | 0, fx = u - x0, fy = v - y0;
+      const i00 = (y0 * sw + x0) * 4, i10 = i00 + 4, i01 = i00 + sw * 4, i11 = i01 + 4;
+      for (let ch = 0; ch < 3; ch++) {
+        o[oi + ch] = (sd[i00 + ch] * (1 - fx) + sd[i10 + ch] * fx) * (1 - fy) + (sd[i01 + ch] * (1 - fx) + sd[i11 + ch] * fx) * fy;
+      }
+      o[oi + 3] = 255;
+    }
+    ctx.putImageData(od, 0, 0);
     return c;
   }
 
@@ -344,7 +437,7 @@
          .replace(/[ 　\t]+/g, ' ')
          .trim()
          .replace(/\s{2,}\S{1,2}$/, '')          // 縦書き認識で末尾に付く1〜2文字のゴミ
-         .replace(/^[。、．，・:：|｜lI]+\s*|[。、．，・:：|｜]+$/g, '').trim()
+         .replace(/^[。、．，・:：|｜lI_\[\]()“”"'`「」]+\s*|[。、．，・:：|｜_\[\]“”"'`「」]+$/g, '').trim()
          .replace(/(https?:\/\/www)[\s.]+(?=[a-z0-9\-]+\.)/i, '$1.')   // 「https://www example.co.jp」の空白をつなぐ
          .replace(/(https?:\/\/\S+?)\.?\s+(?=(?:co\.|ne\.|or\.)?(?:jp|com|net|org)\b)/i, '$1.');   // 「https://www.example co.jp」
     // 日本語文字同士の間のスペースを除去
@@ -360,7 +453,7 @@
     url: /(?:https?:\/\/|www\.)[^\s　]+|[A-Za-z0-9\-]+\.(?:co\.jp|com|jp|net|org|io)(?:\/[^\s　]*)?/,
     postal: /〒?\s*\d{3}[-‐−]?\d{4}/,
     pref: /(東京都|北海道|(?:京都|大阪)府|[^\s　]{2,3}県)/,
-    company: /(株式会社|有限会社|合同会社|合資会社|\(株\)|\(有\)|一般社団法人|医療法人|Co\.,?\s*Ltd|Inc\.|Corporation|LLC)/i,
+    company: /(株式[会全]社|有限会社|合同会社|合資会社|\(株\)|\(有\)|一般社団法人|医療法人|Co\.,?\s*Ltd|Inc\.|Corporation|LLC)/i,
     sns: /(@[A-Za-z0-9_.]{3,}|\b(?:twitter|x|instagram|facebook|line|linkedin|tiktok)\b)/i,
     phoneNum: /(?:\+81[-\s]?)?0\d{1,4}[-\s()]*\d{1,4}[-\s()]*\d{3,4}/g,
     mobileHead: /^(?:\+81[-\s]?)?0[789]0/,
@@ -375,7 +468,7 @@
 
   // OCRで崩れやすい英数字の後処理（大文字混入・.co.ip→.co.jp・末尾記号）
   function fixLatin(s) {
-    return s.toLowerCase().replace(/\.co\.ip\b/, '.co.jp').replace(/\.c0\./g, '.co.').replace(/[.,:;、。]+$/, '');
+    return s.toLowerCase().replace(/\.co\.ip\b/, '.co.jp').replace(/\.c0\./g, '.co.').replace(/[.,:;、。]+$/, '').replace(/\.co$/, '.co.jp');   // 「.co」で切れた場合は .co.jp とみなす
   }
   function cleanPhone(s) { return s.replace(/[^\d+\-()]/g, '').replace(/\(/g,'').replace(/\)/g,'-').replace(/-+/g,'-').replace(/^-|-$/g,''); }
 
@@ -466,7 +559,7 @@
       }
 
       if (!used && RE.company.test(t)) {
-        if (!out.company) out.company = t; else rest.push(t);
+        if (!out.company) out.company = t.replace(/株式全社/g, '株式会社'); else rest.push(t);
         used = true;
       }
 
@@ -510,6 +603,37 @@
     const whole = FIELDS.filter(k => k !== 'note' && out[k]).map(k => out[k]);
     out.note = rest.filter(t => !assigned.some(a => similar(a, t, 0.3)) && !whole.some(a => similar(a, t, 0.3))).join('\n');
     return out;
+  }
+
+  // インクの行方向分布から「他の行より明らかに背の高い行」（氏名など）の範囲を見つける。座標は k 倍して返す
+  function findBigBands(cv, k) {
+    const W = cv.width, H = cv.height, px = cv.getContext('2d').getImageData(0, 0, W, H).data;
+    const rows = new Uint16Array(H), ink = new Uint8Array(W * H);
+    // 切り抜きの縁に残った机などを除くため、外周（左右8%・上下5%）は無視する
+    const mx = Math.round(W * 0.08), my = Math.round(H * 0.05);
+    for (let y = my; y < H - my; y++) for (let x = mx; x < W - mx; x++) { const i = y * W + x; if (px[i * 4] < 110) { ink[i] = 1; rows[y]++; } }
+    const bands = []; let start = -1, gap = 0;
+    for (let y = 0; y <= H; y++) {
+      const on = y < H && rows[y] > W * 0.012 && rows[y] < (W - 2 * mx) * 0.5;   // 行の半分以上がインク＝机の縁などの帯は除外
+      if (on) { if (start < 0) start = y; gap = 0; }
+      else if (start >= 0 && ++gap > 2) { bands.push({ y0: start, y1: y - gap }); start = -1; }
+    }
+    const heights = bands.map(b => b.y1 - b.y0).filter(h => h >= 6).sort((a, b) => a - b);
+    if (heights.length < 2) return [];
+    const med = heights[heights.length >> 1];
+    const out = [];
+    for (const b of bands) {
+      const h = b.y1 - b.y0;
+      if (h < Math.max(22, med * 1.6) || h > H * 0.4) continue;
+      let x0 = W, x1 = 0;
+      for (let x = 0; x < W; x++) {   // 帯の高さの6割以上がインクの列は縦の縁（机など）とみなして無視
+        let n = 0; for (let y = b.y0; y <= b.y1; y++) n += ink[y * W + x];
+        if (n && n < h * 0.6) { if (x < x0) x0 = x; if (x > x1) x1 = x; }
+      }
+      if (x1 - x0 < h) continue;
+      out.push({ x0: x0 * k, y0: b.y0 * k, x1: (x1 + 1) * k, y1: (b.y1 + 1) * k });
+    }
+    return out.slice(0, 3);
   }
 
   // OCR結果の「読めている度合い」：意味のある文字数で重み付けした信頼度（少なすぎる出力は減点）
@@ -557,16 +681,21 @@
       const r2 = await jpn.recognize(half);
       setStatus(`読み取り中 (3/${N})...`, 0.65);
       const r3 = await eng.recognize(full);
-      // 大きい文字の行（氏名など）は、文字高が約36pxになるよう縮小して1行として読み直す（Tesseractは大きすぎる文字に弱い）
-      const bigLines = (r1.data.lines || []).filter(l => { if (!l.bbox) return false; const bh = l.bbox.y1 - l.bbox.y0, bw = l.bbox.x1 - l.bbox.x0; return bh >= 45 && bh <= 110 && bw > bh * 1.5 && /[一-鿿぀-ヿ]/.test(l.text); }).slice(0, 3);
+      // 大きい文字の行（氏名など）は、文字高が約36pxになるよう縮小して1行として読み直す（Tesseractは大きすぎる文字に弱く、行ごと無視することもある）
+      // 対象: (a) Tesseractが検出した文字高45px以上の行 (b) 画像のインク分布から見つけた「他の行より明らかに背の高い行」
+      const bigLines = (r1.data.lines || []).filter(l => { if (!l.bbox) return false; const bh = l.bbox.y1 - l.bbox.y0, bw = l.bbox.x1 - l.bbox.x0; return bh >= 45 && bh <= 220 && bw > bh * 1.2 && /[一-鿿぀-ヿ]/.test(l.text); })
+        .map(l => ({ x0: l.bbox.x0, y0: l.bbox.y0, x1: l.bbox.x1, y1: l.bbox.y1 }));
+      for (const b of findBigBands(half, full.width / half.width)) {
+        if (!bigLines.some(l => Math.abs(l.y0 - b.y0) < 20 && Math.abs(l.y1 - b.y1) < 20)) bigLines.push(b);
+      }
       const reread = [];
       if (bigLines.length) {
         await jpn.setParameters({ tessedit_pageseg_mode: '7' });   // 7 = 1行として扱う
-        for (const l of bigLines) {
-          const bh = l.bbox.y1 - l.bbox.y0, pad = bh * 0.3, sc = 36 / bh;
+        for (const l of bigLines.slice(0, 4)) {
+          const bh = l.y1 - l.y0, pad = bh * 0.3, sc = 36 / bh;
           const c = document.createElement('canvas');
-          const sx = Math.max(0, l.bbox.x0 - pad), sy = Math.max(0, l.bbox.y0 - pad);
-          const sw = Math.min(full.width - sx, l.bbox.x1 - l.bbox.x0 + pad * 2), sh = Math.min(full.height - sy, bh + pad * 2);
+          const sx = Math.max(0, l.x0 - pad), sy = Math.max(0, l.y0 - pad);
+          const sw = Math.min(full.width - sx, l.x1 - l.x0 + pad * 2), sh = Math.min(full.height - sy, bh + pad * 2);
           c.width = Math.max(8, Math.round(sw * sc)); c.height = Math.max(8, Math.round(sh * sc));
           c.getContext('2d').drawImage(full, sx, sy, sw, sh, 0, 0, c.width, c.height);
           const rr = await jpn.recognize(c);
