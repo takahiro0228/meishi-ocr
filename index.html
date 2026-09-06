@@ -25,6 +25,9 @@
   details { margin-top:12px; }
   details pre { white-space:pre-wrap; font-size:12px; background:var(--card); border:1px solid var(--line); border-radius:8px; padding:10px; }
   #results { display:none; }
+  #cropWrap { display:none; margin-top:12px; }
+  #crop { width:100%; display:block; border-radius:8px; border:1px solid var(--line); touch-action:none; background:#222; }
+  #cropWrap .hint { font-size:12px; color:var(--sub); margin:6px 0 0; }
 </style>
 </head>
 <body>
@@ -33,7 +36,15 @@
   <input type="file" id="file" accept="image/*" capture="environment" hidden>
   <button class="btn" id="shoot">名刺を撮影 / 画像を選択</button>
   <p id="hint" style="font-size:12px;color:var(--sub);margin:8px 0 0">コツ：明るい場所で、影を入れず真上から、名刺が画面いっぱいになるように撮影してください。</p>
-  <img id="preview" alt="">
+  <div id="cropWrap">
+    <canvas id="crop"></canvas>
+    <p class="hint">名刺に合わせて枠を調整してください（角をドラッグで拡縮、中をドラッグで移動）</p>
+    <div class="row">
+      <button class="btn sub" id="rotate">回転</button>
+      <button class="btn sub" id="reset">枠を全体に</button>
+    </div>
+    <button class="btn" id="ocr" style="margin-top:8px">この範囲を読み取る</button>
+  </div>
   <div id="status"></div>
   <progress id="prog" value="0" max="1" hidden></progress>
 
@@ -80,13 +91,22 @@
       Tesseract.createWorker('eng', 1, { logger })
     ]);
     await Promise.all([jpn, eng].map(w => w.setParameters({ preserve_interword_spaces: '1' })));
-    workers = { jpn, eng };
+    workers = { jpn, eng, vert: null };
     return workers;
+  }
+  // 縦書き用モデルは必要になった時だけ読み込む（約3MB）
+  async function getVertWorker() {
+    const w = await getWorkers();
+    if (w.vert) return w.vert;
+    setStatus('縦書き用モデルを準備中...', 0);
+    w.vert = await Tesseract.createWorker('jpn_vert', 1, {});
+    await w.vert.setParameters({ preserve_interword_spaces: '1', tessedit_pageseg_mode: '5' });   // 5 = 縦書きブロック
+    return w.vert;
   }
 
   // 画像をリサイズ＋グレースケール化してOCR精度と速度を安定させる
   function toGray(img, maxSide) {
-        const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
+        const scale = maxSide / Math.max(img.width, img.height);   // 小さい切り抜きは拡大（Tesseractは小さすぎる文字に弱い）
         const c = document.createElement('canvas');
         c.width = Math.round(img.width * scale);
         c.height = Math.round(img.height * scale);
@@ -114,19 +134,205 @@
         return c;
   }
 
-  // 大きい文字（氏名など）は高解像度だと誤読しやすいため、通常と半分の2解像度でOCRする
-  function preprocess(file) {
+  // ---------- 画像読み込み・回転・名刺領域の自動検出・手動トリミング ----------
+  // ブラウザはEXIFの向きを自動適用するため、縦持ち／横持ちどちらの撮影でも見た目どおりに読み込まれる
+  function loadImage(file) {
     return new Promise((resolve, reject) => {
       const img = new Image();
       img.onload = () => {
-        const full = toGray(img, 1400);
-        const half = toGray(img, 700);
+        const MAX = 2000;   // 巨大画像は縮小して扱う（メモリ・速度対策）
+        const sc = Math.min(1, MAX / Math.max(img.width, img.height));
+        const c = document.createElement('canvas');
+        c.width = Math.round(img.width * sc); c.height = Math.round(img.height * sc);
+        c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
         URL.revokeObjectURL(img.src);
-        resolve({ full, half });
+        resolve(c);
       };
       img.onerror = () => reject(new Error('画像を読み込めません'));
       img.src = URL.createObjectURL(file);
     });
+  }
+
+  function rotate90(src) {   // 時計回りに90度
+    const c = document.createElement('canvas');
+    c.width = src.height; c.height = src.width;
+    const ctx = c.getContext('2d');
+    ctx.translate(c.width, 0); ctx.rotate(Math.PI / 2); ctx.drawImage(src, 0, 0);
+    return c;
+  }
+
+  // 名刺領域の自動検出：明るい矩形（名刺は背景より明るいことが多い）→ 文字のある範囲 → 全体 の順で試す
+  function detectCard(src) {
+    const W = 480, H = Math.round(src.height * W / src.width);
+    const c = document.createElement('canvas'); c.width = W; c.height = H;
+    const ctx = c.getContext('2d'); ctx.drawImage(src, 0, 0, W, H);
+    const px = ctx.getImageData(0, 0, W, H).data;
+    const g = new Uint8Array(W * H);
+    for (let i = 0; i < W * H; i++) g[i] = (0.299 * px[i*4] + 0.587 * px[i*4+1] + 0.114 * px[i*4+2]) | 0;
+    const sx = src.width / W, sy = src.height / H;
+    const toRect = (x0, y0, x1, y1) => ({ x: x0 * sx, y: y0 * sy, w: (x1 - x0 + 1) * sx, h: (y1 - y0 + 1) * sy });
+
+    // 1) 画像の縁の色を背景色とみなし、背景と色が異なる画素の最大連結成分を名刺とする
+    const border = [[], [], []], m = Math.max(2, Math.round(Math.min(W, H) * 0.04));
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+      if (x < m || y < m || x >= W - m || y >= H - m) { const i = (y * W + x) * 4; border[0].push(px[i]); border[1].push(px[i+1]); border[2].push(px[i+2]); }
+    }
+    const med = a => { a.sort((p, q) => p - q); return a[a.length >> 1]; };
+    const bg = border.map(med);
+    const fg = new Uint8Array(W * H);
+    for (let i = 0; i < W * H; i++) {
+      const d = Math.max(Math.abs(px[i*4] - bg[0]), Math.abs(px[i*4+1] - bg[1]), Math.abs(px[i*4+2] - bg[2]));
+      fg[i] = d > 40 ? 1 : 0;
+    }
+    const lab = new Int32Array(W * H).fill(-1);
+    let bestArea = 0, bestBox = null; const stack = [];
+    for (let s0 = 0; s0 < W * H; s0++) {
+      if (!fg[s0] || lab[s0] >= 0) continue;
+      let area = 0, x0 = W, y0 = H, x1 = 0, y1 = 0; stack.push(s0); lab[s0] = s0;
+      while (stack.length) {
+        const i = stack.pop(); area++;
+        const x = i % W, y = (i / W) | 0;
+        if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+        for (const j of [i - 1, i + 1, i - W, i + W]) {
+          if (j < 0 || j >= W * H || lab[j] >= 0 || !fg[j]) continue;
+          if ((j === i - 1 && x === 0) || (j === i + 1 && x === W - 1)) continue;
+          lab[j] = s0; stack.push(j);
+        }
+      }
+      if (area > bestArea) { bestArea = area; bestBox = { x0, y0, x1, y1 }; }
+    }
+    if (bestBox) {
+      // 名刺の脇に写り込んだ明るい机などを削る：各辺について「ほぼ全行（列）にエッジが連続する位置」＝名刺の縁を探す
+      let { x0, y0, x1, y1 } = bestBox;
+      const ex = new Uint8Array(W * H), ey = new Uint8Array(W * H);
+      for (let y = 1; y < H - 1; y++) for (let x = 1; x < W - 1; x++) { const i = y * W + x; ex[i] = Math.abs(g[i+1] - g[i-1]) > 25 ? 1 : 0; ey[i] = Math.abs(g[i+W] - g[i-W]) > 25 ? 1 : 0; }
+      const edgeFrac = (vertical, c, a, b) => {   // vertical: 列cの周辺±12列に、行a..bのうちエッジを持つ行の割合
+        let n = 0;
+        for (let t = a; t <= b; t++) {
+          let hit = 0;
+          for (let d = -12; d <= 12 && !hit; d++) {
+            const xx = vertical ? c + d : t, yy = vertical ? t : c + d;
+            if (xx < 1 || yy < 1 || xx >= W - 1 || yy >= H - 1) continue;
+            if (vertical ? ex[yy * W + xx] : ey[yy * W + xx]) hit = 1;
+          }
+          n += hit;
+        }
+        return n / (b - a + 1);
+      };
+      const findSide = (vertical, from, to, step) => {   // 外側から内側へ走査し、最初に見つかった連続エッジを縁とする
+        for (let c = from; step > 0 ? c <= to : c >= to; c += step) { if (edgeFrac(vertical, c, vertical ? y0 : x0, vertical ? y1 : x1) > 0.75) return c; }
+        return -1;
+      };
+      const bw0 = x1 - x0, bh0 = y1 - y0;
+      let r; r = findSide(true, x1, x0 + Math.round(bw0 * 0.55), -1); if (r >= 0) x1 = r;
+      r = findSide(true, x0, x1 - Math.round(bw0 * 0.55), 1); if (r >= 0) x0 = r;
+      r = findSide(false, y1, y0 + Math.round(bh0 * 0.55), -1); if (r >= 0) y1 = r;
+      r = findSide(false, y0, y1 - Math.round(bh0 * 0.55), 1); if (r >= 0) y0 = r;
+      const bw = x1 - x0 + 1, bh = y1 - y0 + 1;
+      let inside = 0; for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) if (fg[y * W + x]) inside++;
+      const fill = inside / (bw * bh), areaRatio = (bw * bh) / (W * H);
+      if (fill > 0.6 && areaRatio > 0.08 && areaRatio < 0.97) return toRect(x0, y0, x1, y1);
+    }
+    // 2) エッジ密度から文字のある範囲を推定し、少し余白を付ける
+    const rows = new Float32Array(H), cols = new Float32Array(W);
+    for (let y = 1; y < H - 1; y++) for (let x = 1; x < W - 1; x++) {
+      const i = y * W + x, e = Math.abs(g[i+1] - g[i-1]) + Math.abs(g[i+W] - g[i-W]);
+      if (e > 30) { rows[y]++; cols[x]++; }
+    }
+    // エッジ総量の0.5%〜99.5%が収まる範囲（1行だけの細い文字も取りこぼさない）
+    const span = (arr, n) => { let tot = 0; for (let i = 0; i < n; i++) tot += arr[i]; let a = 0, b = n - 1, acc = 0; while (a < n && acc + arr[a] < tot * 0.005) acc += arr[a++]; acc = 0; while (b > a && acc + arr[b] < tot * 0.005) acc += arr[b--]; return [a, b]; };
+    const [ya, yb] = span(rows, H), [xa, xb] = span(cols, W);
+    if (xb - xa > W * 0.2 && yb - ya > H * 0.1) {
+      const mx = (xb - xa) * 0.06, my = (yb - ya) * 0.12;
+      return toRect(Math.max(0, xa - mx), Math.max(0, ya - my), Math.min(W - 1, xb + mx), Math.min(H - 1, yb + my));
+    }
+    // 3) 全体
+    return { x: 0, y: 0, w: src.width, h: src.height };
+  }
+
+  // トリミングUI（枠のドラッグ移動・角のドラッグ拡縮）
+  const cropper = { src: null, rect: null, scale: 1, drag: null };
+  const cropCv = $('crop');
+  function drawCrop() {
+    const { src, rect } = cropper; if (!src) return;
+    const cssW = cropCv.clientWidth || 360;
+    cropper.scale = cssW / src.width;
+    cropCv.width = cssW; cropCv.height = Math.round(src.height * cropper.scale);
+    const ctx = cropCv.getContext('2d'), k = cropper.scale;
+    ctx.drawImage(src, 0, 0, cropCv.width, cropCv.height);
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(0, 0, cropCv.width, cropCv.height);
+    ctx.drawImage(src, rect.x, rect.y, rect.w, rect.h, rect.x * k, rect.y * k, rect.w * k, rect.h * k);
+    ctx.strokeStyle = '#0a5cff'; ctx.lineWidth = 2; ctx.strokeRect(rect.x * k, rect.y * k, rect.w * k, rect.h * k);
+    ctx.fillStyle = '#0a5cff';
+    for (const [cx, cy] of corners()) { ctx.beginPath(); ctx.arc(cx * k, cy * k, 9, 0, Math.PI * 2); ctx.fill(); }
+  }
+  function corners() { const r = cropper.rect; return [[r.x, r.y], [r.x + r.w, r.y], [r.x, r.y + r.h], [r.x + r.w, r.y + r.h]]; }
+  function clampRect() {
+    const r = cropper.rect, s = cropper.src, MIN = 40;
+    r.w = Math.max(MIN, r.w); r.h = Math.max(MIN, r.h);
+    r.x = Math.max(0, Math.min(s.width - r.w, r.x)); r.y = Math.max(0, Math.min(s.height - r.h, r.y));
+    r.w = Math.min(r.w, s.width - r.x); r.h = Math.min(r.h, s.height - r.y);
+  }
+  function ptr(e) { const b = cropCv.getBoundingClientRect(); return { x: (e.clientX - b.left) / cropper.scale, y: (e.clientY - b.top) / cropper.scale }; }
+  cropCv.addEventListener('pointerdown', e => {
+    if (!cropper.src) return;
+    const p = ptr(e), r = cropper.rect, R = 24 / cropper.scale;
+    let corner = -1;
+    corners().forEach(([cx, cy], i) => { if (Math.hypot(p.x - cx, p.y - cy) < R) corner = i; });
+    const inside = p.x > r.x && p.x < r.x + r.w && p.y > r.y && p.y < r.y + r.h;
+    if (corner < 0 && !inside) return;
+    cropper.drag = { corner, start: p, rect: { ...r } };
+    cropCv.setPointerCapture(e.pointerId);
+    e.preventDefault();
+  });
+  cropCv.addEventListener('pointermove', e => {
+    const d = cropper.drag; if (!d) return;
+    const p = ptr(e), dx = p.x - d.start.x, dy = p.y - d.start.y, o = d.rect, r = cropper.rect;
+    if (d.corner < 0) { r.x = o.x + dx; r.y = o.y + dy; }
+    else {
+      const left = d.corner % 2 === 0, top = d.corner < 2;
+      const x0 = left ? o.x + dx : o.x, x1 = left ? o.x + o.w : o.x + o.w + dx;
+      const y0 = top ? o.y + dy : o.y, y1 = top ? o.y + o.h : o.y + o.h + dy;
+      r.x = Math.min(x0, x1); r.w = Math.abs(x1 - x0); r.y = Math.min(y0, y1); r.h = Math.abs(y1 - y0);
+    }
+    clampRect(); drawCrop();
+  });
+  const endDrag = () => { cropper.drag = null; };
+  cropCv.addEventListener('pointerup', endDrag); cropCv.addEventListener('pointercancel', endDrag);
+  window.addEventListener('resize', drawCrop);
+
+  function setSource(src) {
+    cropper.src = src;
+    cropper.rect = detectCard(src);
+    // 検出枠に3%の余白（傾きで角が切れるのを防ぐ）
+    const r = cropper.rect, mx = r.w * 0.03, my = r.h * 0.03;
+    r.x -= mx; r.y -= my; r.w += mx * 2; r.h += my * 2; clampRect();
+    $('cropWrap').style.display = 'block';
+    drawCrop();
+  }
+  // 画像と枠をまとめて時計回りに90度×n回転
+  function rotateAll(n) {
+    for (let i = 0; i < n; i++) {
+      const r = cropper.rect, H = cropper.src.height;
+      cropper.src = rotate90(cropper.src);
+      cropper.rect = { x: H - (r.y + r.h), y: r.x, w: r.h, h: r.w };
+    }
+    drawCrop();
+  }
+  $('rotate').addEventListener('click', () => { if (cropper.src) rotateAll(1); });
+  $('reset').addEventListener('click', () => { if (cropper.src) { cropper.rect = { x: 0, y: 0, w: cropper.src.width, h: cropper.src.height }; drawCrop(); } });
+
+  function cropped() {
+    const r = cropper.rect, c = document.createElement('canvas');
+    c.width = Math.round(r.w); c.height = Math.round(r.h);
+    c.getContext('2d').drawImage(cropper.src, r.x, r.y, r.w, r.h, 0, 0, c.width, c.height);
+    return c;
+  }
+
+  // 大きい文字（氏名など）は高解像度だと誤読しやすいため、通常と半分の2解像度でOCRする
+  function preprocess(img) {
+    return { full: toGray(img, 1400), half: toGray(img, 700) };
   }
 
   // 全角英数・記号を半角に、日本語文字間の余分なスペースを除去
@@ -136,7 +342,11 @@
          .replace(/[‐‑‒–—−ー]/g, m => m)   // 長音は残す
          .replace(/[（）]/g, m => m === '（' ? '(' : ')')
          .replace(/[ 　\t]+/g, ' ')
-         .trim();
+         .trim()
+         .replace(/\s{2,}\S{1,2}$/, '')          // 縦書き認識で末尾に付く1〜2文字のゴミ
+         .replace(/^[。、．，・:：|｜lI]+\s*|[。、．，・:：|｜]+$/g, '').trim()
+         .replace(/(https?:\/\/www)[\s.]+(?=[a-z0-9\-]+\.)/i, '$1.')   // 「https://www example.co.jp」の空白をつなぐ
+         .replace(/(https?:\/\/\S+?)\.?\s+(?=(?:co\.|ne\.|or\.)?(?:jp|com|net|org)\b)/i, '$1.');   // 「https://www.example co.jp」
     // 日本語文字同士の間のスペースを除去
     const JP = '[\\u3040-\\u30ff\\u3400-\\u9fff\\uff66-\\uff9f]';
     const re = new RegExp(`(${JP}) +(?=${JP})`, 'g');
@@ -157,7 +367,7 @@
     telLabel: /^(TEL|Tel|電話|直通|代表)[.:：\s]*/i,
     faxLabel: /(FAX|Fax|ファックス)/i,
     mobileLabel: /(携帯|Mobile|MOBILE|Cell)/i,
-    nameLike: /^(?=.*[一-鿿])[一-鿿぀-ヿ]{1,4} ?[一-鿿぀-ヿ]{1,4}$/,
+    nameLike: /^(?=.*[一-鿿])(?:[一-鿿぀-ヿ]{1,5} ?){1,3}$/,
     nameKana: /^[぀-ゟ゠-ヿ ]{3,12}$/,
     titleWord: /(部長|課長|係長|主任|取締役|代表|社長|専務|常務|会長|所長|店長|支店長|本部長|室長|リーダー|マネージャー|マネジャー|コンサルタント|エンジニア|プランナー|デザイナー|担当|Manager|Director|President|CEO|CTO|COO|CFO|Engineer|Leader|Consultant)/i,
     deptWord: /(本部|事業部|営業部|開発部|総務部|人事部|経理部|企画部|管理部|[^\s　]{1,8}(?:部|課|室|グループ|チーム|Division|Department|Dept\.?|Team))/i
@@ -181,6 +391,13 @@
   function appendUnique(cur, t) {
     if (!cur) return t;
     return cur.split(' ').some(p => similar(p, t, 0.3)) ? cur : cur + ' ' + t;
+  }
+  // 1文字の断片が並んだ行か（2語以上あり、半数以上が1文字、全体で4文字以下）
+  function isFragment(raw) {
+    const tok = raw.trim().split(/[ 　]+/).filter(Boolean);
+    const chars = tok.join('').length;
+    if (chars <= 1) return true;
+    return tok.length >= 2 && chars <= 4 && tok.filter(x => x.length === 1).length >= tok.length / 2;
   }
   // 意味のある文字（漢字・かな・英数）の割合。大きい文字の誤読ノイズを除くため
   function meaningfulRatio(s) {
@@ -206,12 +423,14 @@
     const out = Object.fromEntries(FIELDS.map(k => [k, '']));
     const rest = [];
     const nameCands = [];
+    const fallbackCands = [];
 
     for (const ln of lines) {
       let t = normalize(ln.text);
       if (!t) continue;
-      if (!ln.prio && ((ln.conf || 0) < 50 || meaningfulRatio(t) < 0.6)) continue;   // 低信頼度・記号だらけの行は捨てる
-      t = t.replace(/^[T〒]\s*(?=\d{3}-?\d{4})/, '〒');   // 〒がTに誤読されるケース
+      if (!ln.prio && ((ln.conf || 0) < 50 || meaningfulRatio(t) < 0.6 || ln.rawH > 110)) continue;   // 低信頼度・記号だらけ・縦に長すぎる（縦書きの誤読）行は捨てる
+      if (isFragment(ln.text)) continue;   // 「貴 》 ゥ」のような1文字の断片の寄せ集め（縦書きを横書きとして読んだゴミ）
+      t = t.replace(/^[T〒]\s*(?=\d{3}[-.．]?\d{4})/, '〒').replace(/^(〒\d{3})[.．](?=\d{4})/, '$1-');   // 〒がTに、ハイフンがピリオドに誤読されるケース
       let used = false;
 
       const em = t.match(RE.email);
@@ -252,71 +471,155 @@
       }
 
       if (!used && (RE.titleWord.test(t) || RE.deptWord.test(t)) && t.length <= 30 && !/\d{3,}/.test(t)) {
-        out.title = appendUnique(out.title, t); used = true;   // 部署・役職行
+        // 「代表取締役社長 二瓶 貴寛」のように役職と氏名が同じ行にある場合は分離する
+        const parts = ln.text.trim().split(/[ 　]{1,}/).filter(Boolean);
+        const namePart = parts.filter(p => !RE.titleWord.test(p) && !RE.deptWord.test(p) && RE.nameLike.test(normalize(p)));
+        const titlePart = parts.filter(p => !namePart.includes(p));
+        if (namePart.length && titlePart.length) {
+          nameCands.push({ t: namePart.join('　'), h: ln.h, conf: (ln.conf || 0) - (ln.rawH > 60 ? 30 : 0) });
+          out.title = appendUnique(out.title, normalize(titlePart.join(' ')));
+        } else {
+          out.title = appendUnique(out.title, t);   // 部署・役職行
+        }
+        used = true;
       }
 
       if (!used) {
         if (RE.nameKana.test(t)) used = true;   // ふりがな行は捨てる
-        else if (RE.nameLike.test(t) && !RE.titleWord.test(t)) { nameCands.push({ t: ln.text.trim().replace(/[ 　]+/g, '　'), h: ln.h, conf: (ln.conf || 0) - (ln.rawH > 60 ? 30 : 0) }); used = true; }   // 認識時の文字高が大きすぎる行は誤読しやすいので減点
+        else if (RE.nameLike.test(t) && t.replace(/ /g, '').length >= 3 && t.replace(/ /g, '').length <= 8 && !RE.titleWord.test(t)) { nameCands.push({ t: ln.text.trim().replace(/\s{2,}\S{1,2}$/, '').replace(/[ 　]+/g, '　'), h: ln.h, conf: (ln.conf || 0) - (ln.rawH > 60 ? 30 : 0) + (ln.prio ? 40 : 0) }); used = true; }   // 縦書きモデルの行は優先   // 認識時の文字高が大きすぎる行は誤読しやすいので減点
       }
       if (!used) rest.push(t);
+      if (!used) fallbackCands.push({ t, h: ln.h, conf: ln.conf || 0 });
     }
 
-    // 氏名候補: 文字高（フォントサイズ）が最大級のものの中で信頼度が最も高い行を採用
+    // 氏名候補が無い場合の保険：未分類行のうち、漢字・かな中心で短く、文字高が最大の行を氏名とみなす
+    if (!nameCands.length) {
+      const fb = fallbackCands.filter(c => /^[一-鿿぀-ヿ 　]{2,10}$/.test(c.t) && /[一-鿿]/.test(c.t)).sort((a, b) => b.h - a.h)[0];
+      if (fb) { nameCands.push({ t: fb.t.replace(/ /g, '　'), h: fb.h, conf: fb.conf }); const i = rest.indexOf(fb.t); if (i >= 0) rest.splice(i, 1); }
+    }
+
+    // 氏名候補: 信頼度＋文字高ボーナス（最大30点、80px以上で頭打ち）が最も高い行を採用
     if (nameCands.length) {
-      const maxH = Math.max(...nameCands.map(c => c.h));
-      nameCands.sort((a, b) => (b.h >= maxH * 0.8) - (a.h >= maxH * 0.8) || b.conf - a.conf);
+      const score = c => c.conf + Math.min(c.h, 80) / 80 * 30;
+      nameCands.sort((a, b) => score(b) - score(a));
       out.name = nameCands[0].t;
       nameCands.slice(1).forEach(c => { if (!similar(c.t, out.name, 0.35)) rest.push(c.t); });
     }
     // 備考: 既に項目に入った値と似た行（別解像度の誤読など）は除外
     const assigned = FIELDS.filter(k => k !== 'note' && out[k]).flatMap(k => out[k].split(' '));
-    out.note = rest.filter(t => !assigned.some(a => similar(a, t, 0.3))).join('\n');
+    const whole = FIELDS.filter(k => k !== 'note' && out[k]).map(k => out[k]);
+    out.note = rest.filter(t => !assigned.some(a => similar(a, t, 0.3)) && !whole.some(a => similar(a, t, 0.3))).join('\n');
     return out;
   }
 
-  async function run(file) {
+  // OCR結果の「読めている度合い」：意味のある文字数で重み付けした信頼度（少なすぎる出力は減点）
+  function readScore(data) {
+    let wsum = 0, n = 0;
+    for (const l of (data.lines || [])) { const k = (l.text.match(/[一-鿿぀-ヿA-Za-z0-9]/g) || []).length; wsum += l.confidence * k; n += k; }
+    return n ? (wsum / n) * Math.min(1, n / 20) : 0;
+  }
+
+  // 向きの自動判定：縦長の切り抜きは「横書きのまま／縦書き／左右90度回転（横向きに置いた横書き名刺）」の4通りを縮小画像で試し、最も読めた向きを採用
+  async function detectOrientation(img) {
+    const { jpn } = await getWorkers();
+    if (img.height <= img.width * 1.1) return { rot: 0, vertical: false };
+    setStatus('向きを判定中...', 0.05);
+    const cand = [];
+    const h0 = toGray(img, 700);
+    cand.push({ rot: 0, vertical: false, score: readScore((await jpn.recognize(h0)).data) });
+    const vert = await getVertWorker();
+    cand.push({ rot: 0, vertical: true, score: readScore((await vert.recognize(h0)).data) });
+    const r90 = rotate90(img), r270 = rotate90(rotate90(r90));
+    cand.push({ rot: 1, vertical: false, score: readScore((await jpn.recognize(toGray(r90, 700))).data) });
+    cand.push({ rot: 3, vertical: false, score: readScore((await jpn.recognize(toGray(r270, 700))).data) });
+    const horiz = cand.filter(c => !c.vertical).sort((a, b) => b.score - a.score)[0];
+    const v = cand.find(c => c.vertical);
+    // 縦書きは「横書きと混在（氏名だけ縦など）」が多いため、横書きの最良に対して十分読めていれば併用する
+    return { rot: horiz.rot, vertical: v.score >= 40 && v.score >= horiz.score * 0.5 && horiz.rot === 0 };
+  }
+
+  async function run() {
     try {
       $('results').style.display = 'none';
-      const { full, half } = await preprocess(file);
-      $('preview').src = full.toDataURL('image/jpeg', 0.8);
-      $('preview').style.display = 'block';
+      $('ocr').disabled = true;
+      const o = await detectOrientation(cropped());
+      if (o.rot) rotateAll(o.rot);   // 画面上の画像と枠も回転して見た目を合わせる
+      const img = cropped();
+      const { full, half } = preprocess(img);
       const { jpn, eng } = await getWorkers();
       const toLines = (data, scale, prio) => (data.lines || []).map(l => ({
         text: l.text, conf: l.confidence, prio: !!prio, h: l.bbox ? (l.bbox.y1 - l.bbox.y0) * scale : 0, rawH: l.bbox ? (l.bbox.y1 - l.bbox.y0) : 0
       }));
-      setStatus('読み取り中 (1/3)...', 0.1);
+      const N = o.vertical ? 4 : 3;
+      setStatus(`読み取り中 (1/${N})...`, 0.1);
       const r1 = await jpn.recognize(full);
-      setStatus('読み取り中 (2/3)...', 0.45);
+      setStatus(`読み取り中 (2/${N})...`, 0.4);
       const r2 = await jpn.recognize(half);
-      setStatus('読み取り中 (3/3)...', 0.75);
+      setStatus(`読み取り中 (3/${N})...`, 0.65);
       const r3 = await eng.recognize(full);
+      // 大きい文字の行（氏名など）は、文字高が約36pxになるよう縮小して1行として読み直す（Tesseractは大きすぎる文字に弱い）
+      const bigLines = (r1.data.lines || []).filter(l => { if (!l.bbox) return false; const bh = l.bbox.y1 - l.bbox.y0, bw = l.bbox.x1 - l.bbox.x0; return bh >= 45 && bh <= 110 && bw > bh * 1.5 && /[一-鿿぀-ヿ]/.test(l.text); }).slice(0, 3);
+      const reread = [];
+      if (bigLines.length) {
+        await jpn.setParameters({ tessedit_pageseg_mode: '7' });   // 7 = 1行として扱う
+        for (const l of bigLines) {
+          const bh = l.bbox.y1 - l.bbox.y0, pad = bh * 0.3, sc = 36 / bh;
+          const c = document.createElement('canvas');
+          const sx = Math.max(0, l.bbox.x0 - pad), sy = Math.max(0, l.bbox.y0 - pad);
+          const sw = Math.min(full.width - sx, l.bbox.x1 - l.bbox.x0 + pad * 2), sh = Math.min(full.height - sy, bh + pad * 2);
+          c.width = Math.max(8, Math.round(sw * sc)); c.height = Math.max(8, Math.round(sh * sc));
+          c.getContext('2d').drawImage(full, sx, sy, sw, sh, 0, 0, c.width, c.height);
+          const rr = await jpn.recognize(c);
+          // 読み直し結果は正しくても信頼度が極端に低く出ることがあるため、下限55として扱う（別解像度の行と比較して採用される）
+          for (const x of (rr.data.lines || [])) if (normalize(x.text).length >= 2) reread.push({ text: x.text, conf: Math.max(x.confidence, 55), prio: false, h: bh, rawH: 36 });
+        }
+        await jpn.setParameters({ tessedit_pageseg_mode: '3' });
+      }
+      let r4 = null;
+      if (o.vertical) {
+        setStatus(`読み取り中 (4/${N})...`, 0.85);
+        r4 = await (await getVertWorker()).recognize(full);
+      }
       // 英語モデルの結果はメール・URLを含む行だけ採用し、最優先で使う
       const latin = toLines(r3.data, 1, true).filter(l => RE.email.test(l.text) || /(https?:\/\/|www\.)/i.test(l.text));
+      // 縦書きモデルの結果は2文字以上・信頼度35以上の行だけ採用（縦書き行は横書きモデルでは読めないため優先）。文字高は行の幅で代用
+      const vertLines = r4 ? (r4.data.lines || []).filter(l => l.confidence >= 35 && normalize(l.text).length >= 2)
+        .map(l => ({ text: l.text, conf: l.confidence, prio: true, h: l.bbox ? (l.bbox.x1 - l.bbox.x0) : 0, rawH: 0 })) : [];
       // 通常解像度の行を基準に、縮小画像で読めた行（大きい文字など）を信頼度で統合
-      const lines = mergeLines(latin, mergeLines(toLines(r1.data, 1), toLines(r2.data, 2)));
+      const lines = mergeLines(latin.concat(vertLines, reread), mergeLines(toLines(r1.data, 1), toLines(r2.data, 2)));
       const r = extract(lines);
       FIELDS.forEach(k => { $('f_' + k).value = r[k] || ''; });
-      $('raw').textContent = (r1.data.text || '') + '\n----- (縮小画像) -----\n' + (r2.data.text || '') + '\n----- (英語モデル) -----\n' + (r3.data.text || '');
+      $('raw').textContent = (r1.data.text || '') + '\n----- (縮小画像) -----\n' + (r2.data.text || '') + '\n----- (英語モデル) -----\n' + (r3.data.text || '') + (r4 ? '\n----- (縦書きモデル) -----\n' + (r4.data.text || '') : '');
       $('results').style.display = 'block';
       setStatus('読み取り完了。内容を確認・修正してください。', null);
     } catch (e) {
       console.error(e);
       setStatus('エラー: ' + (e && e.message ? e.message : e), null);
+    } finally {
+      $('ocr').disabled = false;
     }
   }
 
   $('shoot').addEventListener('click', () => $('file').click());
-  $('file').addEventListener('change', e => {
+  $('file').addEventListener('change', async e => {
     const f = e.target.files && e.target.files[0];
-    if (f) run(f);
     e.target.value = '';
+    if (!f) return;
+    try {
+      $('results').style.display = 'none';
+      setStatus('', null);
+      setSource(await loadImage(f));
+    } catch (err) {
+      setStatus('エラー: ' + (err && err.message ? err.message : err), null);
+    }
   });
+  $('ocr').addEventListener('click', () => { if (cropper.src) run(); });
   $('clear').addEventListener('click', () => {
     FIELDS.forEach(k => { $('f_' + k).value = ''; });
     $('raw').textContent = '';
     $('results').style.display = 'none';
-    $('preview').style.display = 'none';
+    $('cropWrap').style.display = 'none';
+    cropper.src = null;
     setStatus('', null);
   });
   $('copy').addEventListener('click', async () => {
