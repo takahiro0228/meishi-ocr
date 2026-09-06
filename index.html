@@ -42,14 +42,6 @@
   </div>
   <div id="app" style="display:none">
   <h1><span id="modeTitle">名刺読み取り</span> <a href="#" id="modeBack" style="font-size:12px;font-weight:normal;color:var(--accent);margin-left:8px">モード変更</a></h1>
-  <div id="langRow" style="display:none;margin-bottom:8px">
-    <label style="font-size:12px;color:var(--sub)">言語：
-      <select id="lang" style="font:inherit;font-size:14px;padding:4px 8px;border:1px solid var(--line);border-radius:6px;background:#fff">
-        <option value="jpn" selected>日本語（横書き／縦書き自動）</option>
-        <option value="eng">英語</option>
-      </select>
-    </label>
-  </div>
   <input type="file" id="file" accept="image/*" capture="environment" hidden>
   <button class="btn" id="shoot">撮影 / 画像を選択</button>
   <p id="hint" class="hint">コツ：明るい場所で、影を入れず真上から、名刺が画面いっぱいになるように撮影してください。</p>
@@ -693,19 +685,23 @@
       $('textResults').style.display = 'none';
       $('ocr').disabled = true;
       const img = cropped();
-      const lang = $('lang').value;
       const { jpn, eng } = await getWorkers();
-      let worker = eng, vertical = false;
-      if (lang === 'jpn') {
-        // 横書き／縦書きの判定：1000px縮小画像で両モデルを試し、読めた度合いで決める
-        setStatus('横書き／縦書きを判定中...', 0.05);
-        const probe = toGray(img, 1000);
-        const hs = readScore((await jpn.recognize(probe)).data);
-        const vs = readScore((await (await getVertWorker()).recognize(probe)).data);
-        vertical = vs > hs * 1.15;   // 縦書きが明確に優勢な場合だけ縦書き扱い
-        worker = vertical ? await getVertWorker() : jpn;
-      }
-      setStatus(vertical ? '読み取り中（縦書き）...' : '読み取り中...', 0.3);
+      // 言語・縦横の自動判定：1000px縮小画像で 日本語横書き／日本語縦書き／英語 を試し読みし、読めた度合いで決める
+      setStatus('言語と縦書き／横書きを判定中...', 0.05);
+      const probe = toGray(img, 1000);
+      const hr = await jpn.recognize(probe);
+      const hs = readScore(hr.data);
+      const vs = readScore((await (await getVertWorker()).recognize(probe)).data);
+      const es = readScore((await eng.recognize(probe)).data);
+      // 日本語モデルの出力に占める漢字・かなの割合（日本語文書なら高い）
+      const jt = (hr.data.text || '').replace(/\s/g, '');
+      const cjkRatio = jt.length ? (jt.match(/[一-鿿぀-ヿ]/g) || []).length / jt.length : 0;
+      let lang = 'jpn', vertical = false;
+      if (cjkRatio < 0.15 && es >= hs * 0.8) lang = 'eng';   // 日本語モデルで読んでも漢字・かながほぼ出ない＝英語文書（英語モデルの方が英文の精度が高い）
+      else vertical = vs > hs * 1.15;                                     // 縦書きが明確に優勢な場合だけ縦書き
+      const worker = lang === 'eng' ? eng : (vertical ? await getVertWorker() : jpn);
+      const label = lang === 'eng' ? '英語' : (vertical ? '日本語・縦書き' : '日本語・横書き');
+      setStatus(`読み取り中（${label}と判定）...`, 0.3);
       // 書類は文字が小さいため名刺より大きい解像度で読む
       const full = toGray(img, 2200);
       const r = await worker.recognize(full);
@@ -721,7 +717,7 @@
       });
       $('f_text').value = lines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
       $('textResults').style.display = 'block';
-      setStatus('読み取り完了。内容を確認・修正してください。', null);
+      setStatus(`読み取り完了（${label}として読み取り）。内容を確認・修正してください。`, null);
     } catch (e) {
       console.error(e);
       setStatus('エラー: ' + (e && e.message ? e.message : e), null);
@@ -805,7 +801,6 @@
     $('modeSelect').style.display = 'none';
     $('app').style.display = 'block';
     $('modeTitle').textContent = m === 'card' ? '名刺読み取り' : 'テキスト読み取り';
-    $('langRow').style.display = m === 'text' ? 'block' : 'none';
     $('hint').textContent = m === 'card'
       ? 'コツ：明るい場所で、影を入れず真上から、名刺が画面いっぱいになるように撮影してください。'
       : 'コツ：明るい場所で、影を入れず真上から、文字が画面いっぱいになるように撮影してください。ページの一部だけでも読み取れます。';
